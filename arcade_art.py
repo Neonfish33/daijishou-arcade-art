@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Daijishou Arcade Art
-====================
+Daijishou Art Fetcher
+=====================
 
-Fetch missing arcade box art for the *Daijishou* launcher (Android) straight from the
-public libretro thumbnail repository, and wire it into Daijishou's database.
+Fill in missing box art for the *Daijishou* launcher (Android) from the public libretro
+thumbnail repository, for both arcade and console systems, and wire it into Daijishou's DB.
 
-Why this exists
----------------
-Daijishou's own scraper often fails to fetch art for arcade sets (FBNeo / MAME / Neo Geo),
-because the libretro scraper matches by content CRC and arcade zips don't match, while the
-built-in arcade scrapers (Arcade Italia / DSESS) are frequently unreachable. This tool maps
-each arcade ROM (short name, e.g. ``mslug``) to its libretro title via the libretro RDB
-databases, downloads the matching ``Named_Boxarts`` image, and writes it where Daijishou
-expects it.
+Why
+---
+Daijishou's built-in scrapers often miss art: the libretro scraper matches arcade zips by
+content CRC (which does not match), the arcade sources (Arcade Italia / DSESS) are often
+unreachable, and some console titles never get matched by name. This tool fetches art
+directly from libretro's ``thumbnails.libretro.com`` and writes it where Daijishou expects it.
+
+Two matching modes
+------------------
+* ``rom``  — arcade: map the ROM short name (``mslug``) to a title via the libretro RDB
+  databases, then to the ``Named_Boxarts`` filename.
+* ``name`` — consoles: match the item's own name (No-Intro style) against the system's
+  ``Named_Boxarts`` listing.
 
 Output
 ------
-* ``<out>/<itemId>/box_art.png`` and ``<out>/<itemId>/index.json`` for every item it fixed.
+* ``<out>/<itemId>/box_art.png`` + ``<out>/<itemId>/index.json`` for each fixed item.
 * ``<out>/Daijishou.db`` — a copy of the input DB with ``preview_media_path`` filled in.
 
-Then copy the per-item folders into Daijishou's ``files/preview_media/`` and replace its DB
-(see README).
-
-Requires only the Python standard library.
+Standard library only.
 """
 
 import argparse
@@ -41,17 +43,34 @@ from concurrent.futures import ThreadPoolExecutor
 RDB_BASE = "https://github.com/libretro/libretro-database/raw/master/rdb/"
 THUMB_BASE = "https://thumbnails.libretro.com/"
 
-# Daijishou platform unique_id -> (rdb file, thumbnails system folder)
+# Daijishou platform unique_id -> (mode, rdb_file_or_None, thumbnails system folder)
 PLATFORMS = {
-    "fbneo": ("FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
-    "neogeo": ("FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
-    "mame": ("MAME.rdb", "MAME"),
-    "mame2003plus": ("MAME.rdb", "MAME"),
+    # arcade (match by ROM short name via libretro rdb)
+    "fbneo":        ("rom",  "FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
+    "neogeo":       ("rom",  "FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
+    "mame":         ("rom",  "MAME.rdb", "MAME"),
+    "mame2003plus": ("rom",  "MAME.rdb", "MAME"),
+    "cps1":         ("rom",  "FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
+    "cps2":         ("rom",  "FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
+    "cps3":         ("rom",  "FBNeo - Arcade Games.rdb", "FBNeo - Arcade Games"),
+    # consoles (match by item name)
+    "gb":           ("name", None, "Nintendo - Game Boy"),
+    "gbc":          ("name", None, "Nintendo - Game Boy Color"),
+    "gba":          ("name", None, "Nintendo - Game Boy Advance"),
+    "nes":          ("name", None, "Nintendo - Nintendo Entertainment System"),
+    "snes":         ("name", None, "Nintendo - Super Nintendo Entertainment System"),
+    "n64":          ("name", None, "Nintendo - Nintendo 64"),
+    "nds":          ("name", None, "Nintendo - Nintendo DS"),
+    "psp":          ("name", None, "Sony - PlayStation Portable"),
+    "psx":          ("name", None, "Sony - PlayStation"),
+    "dreamcast":    ("name", None, "Sega - Dreamcast"),
+    "megadrive":    ("name", None, "Sega - Mega Drive - Genesis"),
+    "msx":          ("name", None, "Microsoft - MSX"),
 }
 
 
 def http_get(url, timeout=90):
-    req = urllib.request.Request(url, headers={"User-Agent": "daijishou-arcade-art"})
+    req = urllib.request.Request(url, headers={"User-Agent": "daijishou-art"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -63,7 +82,6 @@ def normalize(text):
 # ---- libretro RDB (RARCHDB) parsing ----------------------------------------------------------
 
 def _decode_value(buf, i):
-    """RARCHDB stores strings length-prefixed; lengths >= 0x20 use a 0xD9 marker + 1-byte len."""
     marker = buf[i]
     if marker == 0xD9:
         length = buf[i + 1]
@@ -101,24 +119,23 @@ def parse_rdb(path):
 # ---- libretro thumbnails listing -------------------------------------------------------------
 
 def load_listing(folder):
-    """{normalized(title): actual_png_filename} from the Named_Boxarts directory index."""
+    """{normalized(title): actual_png_filename} from a system's Named_Boxarts index."""
     page = http_get(THUMB_BASE + urllib.parse.quote(folder) + "/Named_Boxarts/").decode("latin1")
     names = [urllib.parse.unquote(html.unescape(n)) for n in re.findall(r'href="([^"]+\.png)"', page)]
     return {normalize(n[:-4]): n for n in names}
 
 
-def rom_name_from_uri(uri):
-    return urllib.parse.unquote(uri).split("/")[-1].lower()
+def rom_basename(uri):
+    return urllib.parse.unquote(uri).split("/")[-1]
 
 
 def fetch_boxart(url, dest):
-    data = http_get(url)
     with open(dest, "wb") as f:
-        f.write(data)
+        f.write(http_get(url))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fetch arcade box art for Daijishou from libretro thumbnails.")
+    ap = argparse.ArgumentParser(description="Fetch Daijishou box art from libretro thumbnails.")
     ap.add_argument("--db", required=True, help="path to a pulled Daijishou.db")
     ap.add_argument("--out", required=True, help="output folder (staging)")
     ap.add_argument("--threads", type=int, default=16)
@@ -128,20 +145,26 @@ def main():
     cache = os.path.join(args.out, "_cache")
     os.makedirs(cache, exist_ok=True)
 
-    # 1. RDB maps
+    # 1. RDB maps (arcade) and boxart listings (all systems used)
     maps, listings = {}, {}
-    for rdb, folder in set(PLATFORMS.values()):
-        p = os.path.join(cache, rdb)
-        if not os.path.exists(p):
-            print("download rdb:", rdb)
-            open(p, "wb").write(http_get(RDB_BASE + urllib.parse.quote(rdb)))
-        maps[rdb] = parse_rdb(p)
+    for mode, rdb, folder in PLATFORMS.values():
+        if mode == "rom" and rdb not in maps:
+            p = os.path.join(cache, rdb)
+            if not os.path.exists(p):
+                print("download rdb:", rdb)
+                open(p, "wb").write(http_get(RDB_BASE + urllib.parse.quote(rdb)))
+            maps[rdb] = parse_rdb(p)
+            print(f"  {rdb}: {len(maps[rdb])} titles")
+    for folder in sorted({f for _, _, f in PLATFORMS.values()}):
         if folder not in listings:
             print("download listing:", folder)
-            listings[folder] = load_listing(folder)
-        print(f"  {rdb}: {len(maps[rdb])} titles")
+            try:
+                listings[folder] = load_listing(folder)
+            except Exception as e:
+                print("  skip", folder, e)
+                listings[folder] = {}
 
-    # 2. work the Daijishou DB
+    # 2. work the DB
     out_db = os.path.join(args.out, "Daijishou.db")
     shutil.copyfile(args.db, out_db)
     con = sqlite3.connect(out_db)
@@ -150,24 +173,27 @@ def main():
 
     plat_ids = {r[1]: r[0] for r in cur.execute("select id, unique_id from PlatformEntity")}
 
-    tasks = []  # (item_id, url, png_path)
-    for uid, (rdb, folder) in PLATFORMS.items():
+    tasks = []  # (item_id, url, png)
+    for uid, (mode, rdb, folder) in PLATFORMS.items():
         pid = plat_ids.get(uid)
-        if pid is None:
+        if pid is None or not listings.get(folder):
             continue
-        for iid, uri in cur.execute(
-                "select id, uri from PlayableItemEntity "
+        for iid, name, uri in cur.execute(
+                "select id, name, uri from PlayableItemEntity "
                 "where attached_platform_id=? and (preview_media_path is null or preview_media_path='')",
                 (pid,)):
-            if not uri:
-                continue
-            rom = rom_name_from_uri(uri)
-            title = maps[rdb].get(rom) or maps[rdb].get(rom.rsplit(".", 1)[0] + ".zip")
+            title = None
+            if mode == "rom" and uri:
+                rom = rom_basename(uri).lower()
+                title = maps[rdb].get(rom) or maps[rdb].get(rom.rsplit(".", 1)[0] + ".zip")
+            elif mode == "name":
+                title = name
             fn = listings[folder].get(normalize(title)) if title else None
+            if not fn and uri:
+                fn = listings[folder].get(normalize(rom_basename(uri).rsplit(".", 1)[0]))
             if not fn:
                 continue
-            url = (THUMB_BASE + urllib.parse.quote(folder) + "/Named_Boxarts/"
-                   + urllib.parse.quote(fn))
+            url = THUMB_BASE + urllib.parse.quote(folder) + "/Named_Boxarts/" + urllib.parse.quote(fn)
             d = os.path.join(args.out, str(iid))
             os.makedirs(d, exist_ok=True)
             tasks.append((iid, url, os.path.join(d, "box_art.png")))
